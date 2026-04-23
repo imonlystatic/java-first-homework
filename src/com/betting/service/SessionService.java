@@ -35,18 +35,26 @@ public class SessionService {
      * @return
      */
     public Session getOrCreate(int customerId) {
-        Session s = byCustomer.get(customerId);
-        if (s != null && !s.isExpired()) {
-            s.renew();
-            return s;
+        Session session = byCustomer.get(customerId);
+        if (session != null && !session.isExpired()) {
+            session.renew();
+            return session;
         }
-        // create new session
-        String key = SessionKeyGenerator.generate();
-        Session newSession = new Session(key, customerId);
-        byCustomer.put(customerId, newSession);
-        byKey.put(key, newSession);
-        if (s != null) byKey.remove(s.getKey()); // 移除旧 key
-        return newSession;
+        // fix race condition: sync on customerId to avoid inconsistent state between byCustomer and byKey
+        synchronized (byCustomer) {
+            // double check inside lock
+            session = byCustomer.get(customerId);
+            if (session != null && !session.isExpired()) {
+                session.renew();
+                return session;
+            }
+            String key = SessionKeyGenerator.generate();
+            Session newSession = new Session(key, customerId);
+            byCustomer.put(customerId, newSession);
+            byKey.put(key, newSession);
+            if (session != null) byKey.remove(session.getKey());
+            return newSession;
+        }
     }
 
     /**
@@ -57,9 +65,9 @@ public class SessionService {
      */
     public int resolveCustomer(String sessionKey) {
         if (sessionKey == null) return -1;
-        Session s = byKey.get(sessionKey);
-        if (s == null || s.isExpired()) return -1;
-        return s.getCustomerId();
+        Session session = byKey.get(sessionKey);
+        if (session == null || session.isExpired()) return -1;
+        return session.getCustomerId();
     }
 
     /**

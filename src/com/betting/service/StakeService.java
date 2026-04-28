@@ -2,75 +2,164 @@ package com.betting.service;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Stake service
+ * Stake service — strong consistency + bounded memory.
+ * <p>
+ * - Per-offer memory capped by probabilistic trim.
+ * - Global offer count capped by LRU-like eviction.
+ * - Cache invalidation is atomic (version bound to cache state), no stale write-back.
  */
 public class StakeService {
     private static final int TOP_N = 20;
 
-    // betOfferId -> ( customerId -> highest stake )
-    private final ConcurrentHashMap<Integer, ConcurrentHashMap<Integer, Integer>> data =
-            new ConcurrentHashMap<>();
+    private static final int MAX_CUSTOMERS_PER_OFFER = 10000;
 
-    // cache to avoid sorting every time, invalidate on write
-    private final ConcurrentHashMap<Integer, String> cache = new ConcurrentHashMap<>();
+    private static final int MAX_OFFERS = 10000;
 
-    /**
-     * stake, save highest amount for same customer
-     *
-     * @param betOfferId
-     * @param customerId
-     * @param stake
-     */
+    private final ConcurrentHashMap<Integer, BetOfferData> betOfferDataMap = new ConcurrentHashMap<>();
+
     public void post(int betOfferId, int customerId, int stake) {
-        data.computeIfAbsent(betOfferId, id -> new ConcurrentHashMap<>())
-                .merge(customerId, stake, Math::max);
-        // invalidate cache for this betOfferId
-        cache.remove(betOfferId);
+        BetOfferData offer = betOfferDataMap.computeIfAbsent(betOfferId, k -> new BetOfferData());
+        offer.post(customerId, stake);
+
+        // probabilistic global cleanup to avoid blocking the hot path
+        if (betOfferDataMap.size() > MAX_OFFERS && ThreadLocalRandom.current().nextInt(10) == 0) {
+            trimOldOffers();
+        }
+    }
+
+    public String highStakes(int betOfferId) {
+        BetOfferData offer = betOfferDataMap.get(betOfferId);
+        if (offer == null) return "";
+        return offer.getHighStakes();
     }
 
     /**
-     * return top 20 stakes, order by amount in desc, return "" when no data
-     *
-     * @param betOfferId
-     * @return
+     * Remove oldest offers until we are back under the limit.
      */
-    public String highStakes(int betOfferId) {
-        // try cache first
-        String cached = cache.get(betOfferId);
-        if (cached != null) return cached;
+    private void trimOldOffers() {
+        int targetSize = MAX_OFFERS * 9 / 10;
+        List<Map.Entry<Integer, BetOfferData>> list = new ArrayList<>(betOfferDataMap.entrySet());
+        // sort by last access time ascending → oldest first
+        list.sort(Comparator.comparingLong(e -> e.getValue().lastAccessTime));
+        int remove = list.size() - targetSize;
+        for (int i = 0; i < remove && i < list.size(); i++) {
+            Map.Entry<Integer, BetOfferData> e = list.get(i);
+            betOfferDataMap.remove(e.getKey(), e.getValue());
+        }
+    }
 
-        ConcurrentHashMap<Integer, Integer> stakes = data.get(betOfferId);
-        if (stakes == null || stakes.isEmpty()) return "";
+    /**
+     * Bet offer data
+     */
+    private static class BetOfferData {
+        private final ConcurrentHashMap<Integer, Integer> stakes = new ConcurrentHashMap<>();
+        private final AtomicLong version = new AtomicLong(0);
+        private volatile CacheState cacheState;
+        private volatile long lastAccessTime = System.nanoTime();
 
-        // use min-heap to find top N, O(n log N) where N=20, much better than full sort O(n log n)
-        PriorityQueue<Map.Entry<Integer, Integer>> heap =
-                new PriorityQueue<>(TOP_N, Comparator.comparingInt(Map.Entry::getValue));
+        /**
+         * post stake to cache
+         *
+         * @param customerId
+         * @param stake
+         */
+        public void post(int customerId, int stake) {
+            stakes.merge(customerId, stake, Math::max);
+            long newVersion = version.incrementAndGet();
+            // atomically publish invalidation together with the new version
+            cacheState = new CacheState(null, newVersion);
+            lastAccessTime = System.nanoTime();
 
-        for (Map.Entry<Integer, Integer> entry : stakes.entrySet()) {
-            if (heap.size() < TOP_N) {
-                heap.offer(entry);
-            } else if (entry.getValue() > heap.peek().getValue()) {
-                heap.poll();
-                heap.offer(entry);
+            // probabilistic per-offer memory trim
+            if (stakes.size() > MAX_CUSTOMERS_PER_OFFER
+                    && ThreadLocalRandom.current().nextInt(10) == 0) {
+                trimLowestStakes();
             }
         }
 
-        // sort result in desc order for output
-        List<Map.Entry<Integer, Integer>> topList = new ArrayList<>(heap);
-        topList.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
+        /**
+         * get high statkes
+         *
+         * @return
+         */
+        public String getHighStakes() {
+            lastAccessTime = System.nanoTime();
+            CacheState state = cacheState;
+            if (state != null && state.result != null && state.version == version.get()) {
+                return state.result;
+            }
+            if (stakes.isEmpty()) return "";
 
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < topList.size(); i++) {
-            if (i > 0) sb.append(',');
-            sb.append("customer ").append(topList.get(i).getKey()).append(" posted the stake ")
-                    .append(topList.get(i).getValue());
+            long v = version.get();
+            String result = computeHighStakes();
+
+            // only cache if no new post happened during our computation
+            if (version.get() == v) {
+                cacheState = new CacheState(result, v);
+            }
+            return result;
         }
 
-        String result = sb.toString();
-        cache.put(betOfferId, result);
-        return result;
+        /**
+         * compute high stakes
+         *
+         * @return
+         */
+        private String computeHighStakes() {
+            PriorityQueue<Map.Entry<Integer, Integer>> heap =
+                    new PriorityQueue<>(TOP_N, Comparator.comparingInt(Map.Entry::getValue));
+
+            for (Map.Entry<Integer, Integer> e : stakes.entrySet()) {
+                if (heap.size() < TOP_N) {
+                    heap.offer(e);
+                } else if (e.getValue() > heap.peek().getValue()) {
+                    heap.poll();
+                    heap.offer(e);
+                }
+            }
+
+            List<Map.Entry<Integer, Integer>> topList = new ArrayList<>(heap);
+            topList.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
+
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < topList.size(); i++) {
+                if (i > 0) sb.append(',');
+                sb.append("customer ").append(topList.get(i).getKey()).append(" posted the stake ")
+                        .append(topList.get(i).getValue());
+            }
+            return sb.toString();
+        }
+
+        /**
+         * trim lowest statkes
+         */
+        private void trimLowestStakes() {
+            int targetSize = MAX_CUSTOMERS_PER_OFFER * 9 / 10;
+            PriorityQueue<Integer> heap = new PriorityQueue<>();
+            for (int v : stakes.values()) {
+                heap.offer(v);
+                if (heap.size() > targetSize) heap.poll();
+            }
+            int threshold = heap.isEmpty() ? 0 : heap.peek();
+            stakes.values().removeIf(v -> v <= threshold);
+        }
+    }
+
+    /**
+     * Immutable cache entry bound to a specific version.
+     */
+    private static class CacheState {
+        final String result;
+        final long version;
+
+        CacheState(String result, long version) {
+            this.result = result;
+            this.version = version;
+        }
     }
 
 }
